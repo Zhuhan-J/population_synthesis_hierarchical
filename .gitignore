@@ -4,4 +4,9 @@
 *.pdf
 *.eps
 
+.DS_Store
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+
 run_multilevel.m

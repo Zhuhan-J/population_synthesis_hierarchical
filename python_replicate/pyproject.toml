@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hm-popsyn"
+version = "0.1.0"
+description = "Python replication of Sun-Erath-Cai (2018) hierarchical mixture population synthesis"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Replication Team" }]
+dependencies = [
+  "numpy>=1.24",
+]
+
+[project.scripts]
+hm-popsyn-run = "hm_popsyn.runner:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
