@@ -24,6 +24,24 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tol", type=float, default=1e-8)
     p.add_argument("--seed", type=int, default=12345)
     p.add_argument("--no-rejection", action="store_true", help="Skip two-person rejection correction")
+    p.add_argument(
+        "--initial-oversample",
+        type=float,
+        default=1.5,
+        help="Multiplier for initial draw size when rejection is enabled (>=1.0)",
+    )
+    p.add_argument(
+        "--topup-factor",
+        type=float,
+        default=1.7,
+        help="Multiplier for top-up batch size when rejection leaves a shortfall",
+    )
+    p.add_argument(
+        "--max-topup-iters",
+        type=int,
+        default=10,
+        help="Maximum number of top-up batches before raising on shortfall",
+    )
     return p
 
 
@@ -53,6 +71,9 @@ def main(argv: list[str] | None = None) -> int:
         tol=args.tol,
         seed=args.seed,
         apply_rejection=not args.no_rejection,
+        initial_oversample=args.initial_oversample,
+        topup_factor=args.topup_factor,
+        max_topup_iters=args.max_topup_iters,
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

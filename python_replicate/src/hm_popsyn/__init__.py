@@ -22,7 +22,7 @@ from .synthesis_eval import (
     two_person_pair_features,
 )
 
-__all__ = [ # exported symbols
+__all__ = [
     "EMResult",
     "ModelSelectionResult",
     "bic_score",

@@ -9,8 +9,8 @@ import numpy as np
 from .em import EMResult, fit_em_with_restarts
 from .synthesis_eval import (
     SynthesisResult,
-    apply_two_person_rejection,
     generate_synthetic_population,
+    generate_with_two_person_rejection,
 )
 
 
@@ -42,8 +42,18 @@ def fit_and_generate(
     age_col: int = 0,
     sex_col: int = 1,
     household_size_col: int = 3,
+    initial_oversample: float = 1.5,
+    topup_factor: float = 1.7,
+    max_topup_iters: int = 10,
 ) -> PipelineResult:
-    """Run fit -> synthetic generation -> optional rejection correction."""
+    """Run fit -> synthetic generation -> optional rejection correction.
+
+    When ``apply_rejection=True`` the rejection step uses the oversample-then-redraw
+    strategy in ``generate_with_two_person_rejection`` so the final population contains
+    exactly ``n_households`` rows even when rejection drops a large fraction of
+    two-person households. The ``initial_oversample`` / ``topup_factor`` /
+    ``max_topup_iters`` knobs control that behaviour.
+    """
     em_result, _ = fit_em_with_restarts(
         grpdata=grpdata,
         indgid=indgid,
@@ -58,25 +68,37 @@ def fit_and_generate(
     )
 
     rng = np.random.default_rng(seed)
+    phi_g_lin = [np.exp(x) for x in em_result.log_phi_g]
+    phi_m_lin = [np.exp(x) for x in em_result.log_phi_m]
+
     raw = generate_synthetic_population(
         n_households=n_households,
         pi_g=em_result.pi_g,
         pi_m=em_result.pi_m,
-        phi_g=[np.exp(x) for x in em_result.log_phi_g],
-        phi_m=[np.exp(x) for x in em_result.log_phi_m],
+        phi_g=phi_g_lin,
+        phi_m=phi_m_lin,
         household_size_col=household_size_col,
         rng=rng,
     )
 
     if apply_rejection:
-        final = apply_two_person_rejection(
-            synthetic=raw,
+        # Use a separate Generator so the raw draw above stays reproducible per seed.
+        rej_rng = np.random.default_rng(seed + 1 if seed is not None else None)
+        final = generate_with_two_person_rejection(
+            n_households=n_households,
+            pi_g=em_result.pi_g,
+            pi_m=em_result.pi_m,
+            phi_g=phi_g_lin,
+            phi_m=phi_m_lin,
             target_individual_data=inddata,
             target_individual_group_id=indgid,
+            household_size_col=household_size_col,
             age_col=age_col,
             sex_col=sex_col,
-            household_size_col=household_size_col,
-            rng=rng,
+            initial_oversample=initial_oversample,
+            topup_factor=topup_factor,
+            max_topup_iters=max_topup_iters,
+            rng=rej_rng,
         )
     else:
         final = raw

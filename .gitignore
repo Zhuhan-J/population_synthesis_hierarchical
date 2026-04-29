@@ -10,3 +10,11 @@ __pycache__/
 .ipynb_checkpoints/
 
 run_multilevel.m
+
+# python_replicate local outputs
+python_replicate/.claude/
+python_replicate/artifacts/
+python_replicate/data/generated_*.csv
+python_replicate/data/generated_*.npy
+python_replicate/data/generation_log_*.txt
+python_replicate/data/test_diagnostics.*
