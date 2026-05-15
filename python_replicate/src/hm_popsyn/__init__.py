@@ -16,9 +16,13 @@ from .kernels import int_hist, logsumexp, mnrnd_new, sum_eik, sumdims
 from .pipeline import PipelineResult, fit_and_generate
 from .synthesis_eval import (
     SynthesisResult,
+    apply_rejection_by_size,
     apply_two_person_rejection,
+    extract_pair_features_by_size,
     generate_synthetic_population,
+    generate_with_multi_size_rejection,
     rejection_filter_two_person_households,
+    rejection_filter_by_size,
     two_person_pair_features,
 )
 
@@ -45,8 +49,12 @@ __all__ = [
     "PipelineResult",
     "fit_and_generate",
     "SynthesisResult",
+    "apply_rejection_by_size",
     "apply_two_person_rejection",
+    "extract_pair_features_by_size",
     "generate_synthetic_population",
+    "generate_with_multi_size_rejection",
     "rejection_filter_two_person_households",
+    "rejection_filter_by_size",
     "two_person_pair_features",
 ]

@@ -1,5 +1,5 @@
-"""Synthetic population generation and postprocessing. 
-Given model parameters from EM, generate synthetic households and individuals, then apply rejection correction for two-person households.
+"""Synthetic population generation and postprocessing.
+Given model parameters from EM, generate synthetic households and individuals, then apply rejection correction by household size.
 
 This module is the first implementation block for the Synthesis-Eval Agent.
 """
@@ -7,10 +7,84 @@ This module is the first implementation block for the Synthesis-Eval Agent.
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Sequence
 
 import numpy as np
+
+
+def _build_code_to_index_map(ordered_codes: Sequence[int], max_code: int) -> np.ndarray:
+    mapping = np.full(max_code + 1, -1, dtype=int)
+    for idx, code in enumerate(ordered_codes):
+        mapping[int(code)] = int(idx)
+    return mapping
+
+
+# ---------------------------------------------------------------------------
+# Codebook: seed505 (canonical, sorted by natural age order / alphabetical)
+# ---------------------------------------------------------------------------
+# Ind_AGE: natural ascending order → codes are 1-based sequential (1='0-5', 18='85+').
+# AGE_DIFF_MAX is the maximum possible ordinal difference between two age groups.
+AGE_CODE_ORDER = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+AGE_DIFF_MAX = len(AGE_CODE_ORDER) - 1  # = 17
+AGE_CODE_TO_ORDER = _build_code_to_index_map(AGE_CODE_ORDER, max_code=18)
+
+# Ind_EMPLOY: alphabetical encoding → group semantics preserved, codes reassigned.
+# Group order: Employed, Student, Homemaker, Retired, Child, Not-working/Other.
+EMPLOY_CODE_TO_GROUP = np.full(12, -1, dtype=int)
+EMPLOY_CODE_TO_GROUP[1]  = 0   # Employed Full-Time
+EMPLOY_CODE_TO_GROUP[2]  = 0   # Employed Part-Time  (was 6)
+EMPLOY_CODE_TO_GROUP[9]  = 0   # Self Employed       (was 4)
+EMPLOY_CODE_TO_GROUP[6]  = 0   # National service    (was 8)
+EMPLOY_CODE_TO_GROUP[3]  = 1   # Full Time Student   (was 5)
+EMPLOY_CODE_TO_GROUP[4]  = 2   # Homemaker           (was 2)
+EMPLOY_CODE_TO_GROUP[8]  = 3   # Retired             (was 3)
+EMPLOY_CODE_TO_GROUP[7]  = 4   # Non-schooling Child (unchanged)
+EMPLOY_CODE_TO_GROUP[10] = 5   # Unemployed          (was 9)
+EMPLOY_CODE_TO_GROUP[5]  = 5   # Long-term Medical Leave (was 10)
+EMPLOY_CODE_TO_GROUP[11] = 5   # Voluntary Worker    (unchanged)
+
+# ---------------------------------------------------------------------------
+# Legacy codebook: seed4556 (non-natural age order, original random encoding)
+# Pass _AGE_CODE_TO_ORDER_LEGACY to rejection functions when loading seed4556 data.
+# ---------------------------------------------------------------------------
+_AGE_CODE_ORDER_LEGACY = [
+    12,  # 0-5
+    11,  # 6-9
+    14,  # 10-14
+    7,   # 15-19
+    16,  # 20-24
+    4,   # 25-29
+    1,   # 30-34
+    13,  # 35-39
+    10,  # 40-44
+    6,   # 45-49
+    5,   # 50-54
+    2,   # 55-59
+    3,   # 60-64
+    8,   # 65-69
+    17,  # 70-74
+    9,   # 75-79
+    18,  # 80-84
+    15,  # 85+
+]
+_AGE_CODE_TO_ORDER_LEGACY = _build_code_to_index_map(_AGE_CODE_ORDER_LEGACY, max_code=18)
+
+# Legacy employment grouping: seed4556 encoding (non-alphabetical, original random order).
+# Pass _EMPLOY_CODE_TO_GROUP_LEGACY to rejection functions when loading seed4556 data.
+_EMPLOY_CODE_TO_GROUP_LEGACY = np.full(12, -1, dtype=int)
+_EMPLOY_CODE_TO_GROUP_LEGACY[1]  = 0   # Employed Full-Time
+_EMPLOY_CODE_TO_GROUP_LEGACY[6]  = 0   # Employed Part-Time   (old code 6)
+_EMPLOY_CODE_TO_GROUP_LEGACY[4]  = 0   # Self Employed        (old code 4)
+_EMPLOY_CODE_TO_GROUP_LEGACY[8]  = 0   # National service     (old code 8)
+_EMPLOY_CODE_TO_GROUP_LEGACY[5]  = 1   # Full Time Student    (old code 5)
+_EMPLOY_CODE_TO_GROUP_LEGACY[2]  = 2   # Homemaker            (old code 2)
+_EMPLOY_CODE_TO_GROUP_LEGACY[3]  = 3   # Retired              (old code 3)
+_EMPLOY_CODE_TO_GROUP_LEGACY[7]  = 4   # Non-schooling Child  (old code 7)
+_EMPLOY_CODE_TO_GROUP_LEGACY[9]  = 5   # Unemployed           (old code 9)
+_EMPLOY_CODE_TO_GROUP_LEGACY[10] = 5   # Long-term Medical Leave
+_EMPLOY_CODE_TO_GROUP_LEGACY[11] = 5   # Voluntary Worker
 
 
 @dataclass(slots=True)
@@ -44,6 +118,115 @@ def _group_members(individual_group_id: np.ndarray) -> tuple[np.ndarray, list[np
     for g in groups:
         members.append(np.where(gid == g)[0])
     return groups, members
+
+
+def _map_codes(codes: np.ndarray, mapping: np.ndarray) -> np.ndarray:
+    codes = np.asarray(codes, dtype=int)
+    out = np.full(codes.shape, -1, dtype=int)
+    valid = (codes > 0) & (codes < mapping.shape[0])
+    out[valid] = mapping[codes[valid]]
+    return out
+
+
+def _infer_household_sizes(individual_group_id: np.ndarray, n_households: int) -> np.ndarray:
+    return np.bincount(individual_group_id, minlength=n_households + 1)[1:].astype(int)
+
+
+def extract_pair_features_by_size(
+    individual_data: np.ndarray,
+    individual_group_id: np.ndarray,
+    age_col: int,
+    employ_col: int,
+    age_code_to_order: np.ndarray | None = None,
+    employ_code_to_group: np.ndarray | None = None,
+    age_diff_n_bins: int = 5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Extract (age-diff, employ-diff) features for households of size >= 2.
+
+    Returns
+    -------
+    features:
+        Shape (n_households_with_features, 2), values are 1-based bins.
+    group_ids:
+        Household ids corresponding to each feature row.
+    sizes:
+        Household size for each feature row.
+    invalid_group_ids:
+        Household ids skipped due to invalid or missing age/employ codes.
+
+    Parameters
+    ----------
+    age_diff_n_bins:
+        Number of coarser age-difference bins (default 5).
+        Reduces the raw 18-ordinal-position range to fewer, better-populated bins.
+        Bin mapping: diff in [0..AGE_DIFF_MAX] → bin in [1..age_diff_n_bins] uniformly.
+        Example (n=5): [0-3]→1, [4-7]→2, [8-10]→3, [11-14]→4, [15-17]→5.
+        Feature space becomes age_diff_n_bins × 6 (e.g. 30 cells) instead of 18 × 6 = 108.
+        Set to 18 to disable binning (original behaviour).
+    """
+    ind = np.asarray(individual_data, dtype=int)
+    gid = np.asarray(individual_group_id, dtype=int).ravel()
+    groups, members = _group_members(gid)
+
+    _age_lookup = AGE_CODE_TO_ORDER if age_code_to_order is None else age_code_to_order
+    _emp_lookup = EMPLOY_CODE_TO_GROUP if employ_code_to_group is None else employ_code_to_group
+    age_ord = _map_codes(ind[:, age_col], _age_lookup)
+    employ_grp = _map_codes(ind[:, employ_col], _emp_lookup)
+
+    feats: list[list[int]] = []
+    feat_gid: list[int] = []
+    feat_sizes: list[int] = []
+    invalid_gid: list[int] = []
+
+    for g, idx in zip(groups, members):
+        size = int(idx.size)
+        if size < 2:
+            continue
+
+        ego_idx = idx[0]
+        ego_age = int(age_ord[ego_idx])
+        ego_emp = int(employ_grp[ego_idx])
+        if ego_age < 0 or ego_emp < 0:
+            invalid_gid.append(int(g))
+            continue
+
+        alter_idx = idx[1:]
+        alter_age = age_ord[alter_idx]
+        alter_emp = employ_grp[alter_idx]
+        valid_mask = (alter_age >= 0) & (alter_emp >= 0)
+        if not np.any(valid_mask):
+            invalid_gid.append(int(g))
+            continue
+
+        # MEAN across all ego-alter pairs, rounded to nearest integer.
+        # For size=2, MEAN == MAX, preserving the paper's behaviour exactly.
+        age_diff = round(float(np.mean(np.abs(alter_age[valid_mask] - ego_age))))
+        emp_diff = round(float(np.mean(np.abs(alter_emp[valid_mask] - ego_emp))))
+
+        # Coarser age bins: map raw diff [0..AGE_DIFF_MAX] → [1..age_diff_n_bins].
+        # Reduces the 18-cell age axis to fewer, better-populated bins (default 5).
+        # Formula: bin = floor(diff * n_bins / (AGE_DIFF_MAX + 1)) + 1, capped at n_bins.
+        age_bin = min(int(age_diff) * age_diff_n_bins // (AGE_DIFF_MAX + 1) + 1, age_diff_n_bins)
+        emp_bin = int(emp_diff) + 1   # employment groups already coarse (6 possible values)
+
+        feats.append([age_bin, emp_bin])
+        feat_gid.append(int(g))
+        feat_sizes.append(size)
+
+    if not feats:
+        return (
+            np.zeros((0, 2), dtype=int),
+            np.zeros((0,), dtype=int),
+            np.zeros((0,), dtype=int),
+            np.zeros((0,), dtype=int),
+        )
+
+    return (
+        np.asarray(feats, dtype=int),
+        np.asarray(feat_gid, dtype=int),
+        np.asarray(feat_sizes, dtype=int),
+        np.asarray(invalid_gid, dtype=int),
+    )
 
 
 # paper_ref: Section 4.3, Eq. (3) and Eq. (2)
@@ -135,26 +318,33 @@ def generate_synthetic_population(
 
 # paper_ref: Section 4.4, Eq. (16) and rejection-sampling paragraph
 # matlab_ref: run_two_within_the_same_4.m:112-120
-# intent: apply acceptance-rejection correction for two-person households.
-def rejection_filter_two_person_households(
+# intent: apply acceptance-rejection correction per household size.
+def rejection_filter_by_size(
     proposal_pairs: np.ndarray,
     target_prob: np.ndarray,
     proposal_prob: np.ndarray,
     rng: np.random.Generator | None = None,
     verbose: bool = False,
-) -> np.ndarray:
-    """Return acceptance mask for two-person households.
+) -> tuple[np.ndarray, dict[str, float | int]]:
+    """Return acceptance mask and stats for a batch of households of one size.
 
     proposal_pairs columns:
     - col 0: transformed age difference bin index (1-based)
-    - col 1: transformed sex difference bin index (1-based)
-    
-    If verbose=True, prints alpha calculation details for each pair.
+    - col 1: transformed employ difference bin index (1-based)
     """
     rng = rng or np.random.default_rng()
 
     if proposal_pairs.ndim != 2 or proposal_pairs.shape[1] != 2:
         raise ValueError("proposal_pairs must be shaped (n, 2)")
+
+    if proposal_pairs.size == 0:
+        return np.zeros((0,), dtype=bool), {
+            "n_pairs": 0,
+            "accept_rate": 0.0,
+            "M_raw": 0.0,
+            "M": 0.0,
+            "f1_zero_bins": 0,
+        }
 
     y1 = proposal_pairs[:, 0].astype(int) - 1
     y2 = proposal_pairs[:, 1].astype(int) - 1
@@ -162,66 +352,89 @@ def rejection_filter_two_person_households(
     if np.any(y1 < 0) or np.any(y2 < 0):
         raise ValueError("proposal_pairs must be 1-based indices")
 
-    ratio = target_prob / np.maximum(proposal_prob, 1e-15)
-    M_raw = float(np.max(ratio))
-    M = min(M_raw, 3.0)  # Cap M at 3.0 to prevent pathological rejection from extreme scaling
-    alpha = target_prob[y1, y2] / (M * np.maximum(proposal_prob[y1, y2], 1e-15))
+    eps = 1e-15
+    # M_raw computed only over bins where BOTH distributions are strictly positive.
+    # If we used eps in the denominator for all bins, any zero-proposal / non-zero-target
+    # cell would produce a ratio of ~f_target/1e-15 ≈ 1e13, making M_raw meaningless and
+    # always triggering the 3.0 cap — which is the observed raw=3.00e+13 pattern.
+    # Computing over the overlap gives a meaningful M_raw (typically 1–5 for real data).
+    both_positive = (proposal_prob > eps) & (target_prob > 0)
+    if both_positive.any():
+        M_raw = float(np.max(target_prob[both_positive] / proposal_prob[both_positive]))
+    else:
+        M_raw = 0.0
+    M = min(M_raw, 3.0) if M_raw > 0 else 1.0
+
+    # Acceptance ratio: eps in denominator prevents divide-by-zero for zero-proposal bins.
+    # Those bins get alpha >> 1 → clipped to 1 (always accept if target has mass there).
+    f1_zero_bins = int(np.sum((proposal_prob <= eps) & (target_prob > 0)))
+    alpha = target_prob[y1, y2] / (M * np.maximum(proposal_prob[y1, y2], eps))
     alpha = np.clip(alpha, 0.0, 1.0)
-    
-    if verbose and len(alpha) > 0:
-        accepted_count = np.sum(alpha > 0)
-        print(f"      [ALPHA] Scaling factor M: raw={M_raw:.2e} → capped={M:.1f}")
-        print(f"      [ALPHA] Total size=2 pairs: {len(alpha)}, accept-ready (α>0): {accepted_count} ({100*accepted_count/len(alpha):.1f}%)")
-        shown = min(10, len(alpha))
-        for i in range(shown):
-            y1_orig, y2_orig = proposal_pairs[i]
-            f1_val = proposal_prob[int(y1_orig)-1, int(y2_orig)-1]
-            f2_val = target_prob[int(y1_orig)-1, int(y2_orig)-1]
-            ratio_val = f2_val / max(f1_val, 1e-15)
-            print(f"        Pair {i+1}: (y1={int(y1_orig)}, y2={int(y2_orig)}) f1={f1_val:.6f} f2={f2_val:.6f} f2/f1={ratio_val:.4f} α={alpha[i]:.6f}")
-        if len(alpha) > shown:
-            print(f"        ... ({len(alpha)-shown} more pairs)")
-    
+
+    if verbose and alpha.size > 0:
+        accept_ready = int(np.sum(alpha > 0))
+        cap_note = f" -> capped={M:.3f}" if M_raw > 3.0 else ""
+        print(f"      [ALPHA] Scaling factor M: raw={M_raw:.3f}{cap_note} -> applied={M:.3f}")
+        # "Households" = number of synthetic households of this size being evaluated.
+        # This is NOT the number of feature bins (age_bins × emp_bins).
+        print(
+            f"      [ALPHA] Households: {alpha.size}, accept-ready (alpha>0): {accept_ready} "
+            f"({100*accept_ready/alpha.size:.1f}%)"
+        )
+
     u = rng.random(alpha.shape[0])
-    return u <= alpha
+    accept = u <= alpha
+    stats = {
+        "n_pairs": int(alpha.size),
+        "accept_rate": float(np.mean(accept)) if alpha.size > 0 else 0.0,
+        "M_raw": float(M_raw),
+        "M": float(M),
+        "f1_zero_bins": f1_zero_bins,
+    }
+    return accept, stats
 
 
-# paper_ref: Section 4.4 (construction of y1/y2 for rejection)
-# matlab_ref: run_two_within_the_same_4.m:96-107
-# intent: construct transformed two-person household features used in rejection.
+def rejection_filter_two_person_households(
+    proposal_pairs: np.ndarray,
+    target_prob: np.ndarray,
+    proposal_prob: np.ndarray,
+    rng: np.random.Generator | None = None,
+    verbose: bool = False,
+) -> np.ndarray:
+    warnings.warn(
+        "rejection_filter_two_person_households is deprecated; use rejection_filter_by_size instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    accept, _ = rejection_filter_by_size(
+        proposal_pairs=proposal_pairs,
+        target_prob=target_prob,
+        proposal_prob=proposal_prob,
+        rng=rng,
+        verbose=verbose,
+    )
+    return accept
+
+
 def two_person_pair_features(
     individual_data: np.ndarray,
     individual_group_id: np.ndarray,
     age_col: int,
     sex_col: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Extract (age-difference, sex-difference) features for two-person households.
-
-    Returns
-    -------
-    features:
-        Shape (n_two_person_households, 2), values are 1-based bins.
-    group_ids:
-        Household ids corresponding to each feature row.
-    """
-    ind = np.asarray(individual_data, dtype=int)
-    groups, members = _group_members(individual_group_id)
-
-    feats: list[list[int]] = []
-    feat_gid: list[int] = []
-    for g, idx in zip(groups, members):
-        if idx.size != 2:
-            continue
-        a = ind[idx[0], :]
-        b = ind[idx[1], :]
-        y1 = abs(int(a[age_col]) - int(b[age_col])) + 1
-        y2 = abs(int(a[sex_col]) - int(b[sex_col])) + 1
-        feats.append([y1, y2])
-        feat_gid.append(int(g))
-
-    if not feats:
-        return np.zeros((0, 2), dtype=int), np.zeros((0,), dtype=int)
-    return np.asarray(feats, dtype=int), np.asarray(feat_gid, dtype=int)
+    warnings.warn(
+        "two_person_pair_features is deprecated; use extract_pair_features_by_size instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    feat, gid, sizes, _ = extract_pair_features_by_size(
+        individual_data=individual_data,
+        individual_group_id=individual_group_id,
+        age_col=age_col,
+        employ_col=sex_col,
+    )
+    mask = sizes == 2
+    return feat[mask], gid[mask]
 
 
 def _rejection_diagnostics_for_batch(
@@ -229,115 +442,50 @@ def _rejection_diagnostics_for_batch(
     batch_num: int,
     before_household_data: np.ndarray,
     after_household_data: np.ndarray,
-    prop_feat: np.ndarray,
-    alpha_vals: np.ndarray,
-    accept_mask: np.ndarray,
-    proposal_prob: np.ndarray,
-    target_prob: np.ndarray,
+    stats_by_size: dict[int, dict[str, float | int | bool]],
     household_size_col: int = 3,
 ) -> None:
-    """Print detailed diagnostics for rejection sampling.
-    
-    Verifies:
-    1. Only size=2 households are affected
-    2. Alpha values and acceptance rates per (y1, y2) pair
-    3. Paper equation is correctly implemented
-    """
+    """Print diagnostics for rejection sampling across household sizes."""
     print(f"\n{'='*100}")
     print(f"[DIAG-REJECT] {stage} {batch_num}: REJECTION SAMPLING VERIFICATION")
     print(f"{'='*100}")
-    
-    # Get size distributions
+
     before_sizes = before_household_data[:, household_size_col].astype(int)
     after_sizes = after_household_data[:, household_size_col].astype(int)
-    
-    before_counts = {}
-    after_counts = {}
+
+    before_counts: dict[int, int] = {}
+    after_counts: dict[int, int] = {}
     for s in np.unique(np.concatenate([before_sizes, after_sizes])):
         before_counts[int(s)] = int(np.sum(before_sizes == s))
         after_counts[int(s)] = int(np.sum(after_sizes == s))
-    
-    print(f"\n1. HOUSEHOLD SIZE DISTRIBUTION (before vs after rejection):")
-    print(f"{'Size':>6} {'Before':>12} {'After':>12} {'Dropped':>12} {'Drop%':>10} Status")
-    print("-" * 80)
-    
+
+    print("\n1. HOUSEHOLD SIZE DISTRIBUTION (before vs after rejection):")
+    print(f"{'Size':>6} {'Before':>12} {'After':>12} {'Dropped':>12} {'Drop%':>10}")
+    print("-" * 70)
+
     for size in sorted(set(before_counts.keys()) | set(after_counts.keys())):
         before = before_counts.get(size, 0)
         after = after_counts.get(size, 0)
         dropped = max(before - after, 0)
         drop_pct = 100.0 * dropped / before if before > 0 else 0.0
-        
-        if size == 2:
-            status = "← REJECTION APPLIED"
-        else:
-            status = "(no rejection - should not change)"
-            if dropped > 0:
-                status = "⚠ WARNING: UNEXPECTED DROP!"
-        
-        print(f"{size:6d} {before:12d} {after:12d} {dropped:12d} {drop_pct:9.1f}% {status}")
-    
-    # Verify only size=2 affected
-    print(f"\n2. VALIDATION: Only size=2 should be rejected")
-    non_size2_issues = []
-    for size in before_counts:
-        if size != 2 and before_counts[size] > after_counts.get(size, 0):
-            non_size2_issues.append(f"Size {size}: {before_counts[size]} → {after_counts.get(size, 0)}")
-    
-    if non_size2_issues:
-        print(f"   ✗ FAIL: Non-size=2 households were dropped:")
-        for issue in non_size2_issues:
-            print(f"     - {issue}")
-    else:
-        print(f"   ✓ PASS: Only size=2 rejection was applied")
-    
-    # Alpha pair analysis
-    print(f"\n3. SIZE=2 PAIR-LEVEL REJECTION ANALYSIS")
-    print(f"   Paper equation Sec 4.4: α = f2(y1,y2) / (M × f1(y1,y2))")
-    print(f"   where f1 = synthetic (proposal) distribution")
-    print(f"         f2 = target (real data) distribution")
-    print(f"         M = max(f2/f1) = scaling factor for normalization\n")
-    
-    if len(prop_feat) > 0:
-        # Compute M with same capping logic as rejection_filter_two_person_households
-        ratio = target_prob / np.maximum(proposal_prob, 1e-15)
-        M_raw = float(np.max(ratio))
-        M = min(M_raw, 3.0)  # Cap M at 3.0 to prevent pathological rejection
-        print(f"   Computed M (raw={M_raw:.2e} → capped={M:.1f})\n")
-        
-        # Aggregate by (y1, y2) pair
-        pair_stats = {}
-        for i, (feat, alpha, accepted) in enumerate(zip(prop_feat, alpha_vals, accept_mask)):
-            y1, y2 = int(feat[0]), int(feat[1])
-            f1 = proposal_prob[y1-1, y2-1]
-            f2 = target_prob[y1-1, y2-1]
-            key = (y1, y2)
-            if key not in pair_stats:
-                pair_stats[key] = {'alphas': [], 'accepted': [], 'f1': f1, 'f2': f2}
-            pair_stats[key]['alphas'].append(alpha)
-            pair_stats[key]['accepted'].append(int(accepted))
-        
-        print(f"   Pair Statistics (showing first 15 pairs):")
-        print(f"   {'(y1,y2)':>10} {'f1':>10} {'f2':>10} {'Avg α':>10} {'Accept%':>10} {'Pairs':>8}")
-        print("-" * 80)
-        
-        for (y1, y2), stats in sorted(list(pair_stats.items())[:15]):
-            avg_alpha = np.mean(stats['alphas'])
-            accept_pct = 100.0 * np.mean(stats['accepted'])
-            num_pairs = len(stats['alphas'])
-            f1 = stats['f1']
-            f2 = stats['f2']
-            
-            # Verify manual calculation
-            manual_alpha = f2 / (M * max(f1, 1e-15))
-            manual_alpha = min(manual_alpha, 1.0)
-            
-            print(f"  ({y1:2d},{y2:2d})    {f1:10.6f} {f2:10.6f} {avg_alpha:10.6f} {accept_pct:9.1f}% {num_pairs:8d}")
-        
-        if len(pair_stats) > 15:
-            print(f"   ... and {len(pair_stats)-15} more (y1,y2) pairs")
-    else:
-        print(f"   (No size=2 pairs available)")
-    
+        print(f"{size:6d} {before:12d} {after:12d} {dropped:12d} {drop_pct:9.1f}%")
+
+    print("\n2. PER-SIZE ACCEPTANCE SUMMARY:")
+    print(f"{'Size':>6} {'Proposed':>12} {'Accepted':>12} {'Accept%':>10} {'M':>6} {'f1=0':>8} {'Target?':>9}")
+    print("-" * 80)
+    for size in sorted(stats_by_size.keys()):
+        stats = stats_by_size[size]
+        n_proposed = int(stats.get("n_proposed", 0))
+        n_accepted = int(stats.get("n_accepted", 0))
+        accept_rate = float(stats.get("accept_rate", 0.0)) * 100.0
+        M = float(stats.get("M", 0.0))
+        f1_zero = int(stats.get("f1_zero_bins", 0))
+        has_target = "yes" if not bool(stats.get("target_missing", False)) else "no"
+        print(
+            f"{int(size):6d} {n_proposed:12d} {n_accepted:12d} {accept_rate:9.1f}% "
+            f"{M:6.2f} {f1_zero:8d} {has_target:>9}"
+        )
+
     print(f"\n{'='*100}\n")
 
 
@@ -378,111 +526,150 @@ def _feature_distribution(features: np.ndarray, shape: tuple[int, int] | None = 
 
 # paper_ref: Section 4.4, Eq. (16) and rejection-sampling step
 # matlab_ref: run_two_within_the_same_4.m:112-120 and 175-241
-# intent: postprocess synthetic population to correct two-person household relations.
-def apply_two_person_rejection(
+# intent: postprocess synthetic population to correct household relations by size.
+def apply_rejection_by_size(
     synthetic: SynthesisResult,
     target_individual_data: np.ndarray,
     target_individual_group_id: np.ndarray,
     age_col: int = 0,
-    sex_col: int = 1,
+    employ_col: int = 1,
     household_size_col: int | None = 3,
     rng: np.random.Generator | None = None,
     verbose: bool = False,
     stage: str = "Rejection",
     batch_num: int = 0,
+    age_code_to_order: np.ndarray | None = None,
+    employ_code_to_group: np.ndarray | None = None,
+    min_target_samples: int = 30,
+    age_diff_n_bins: int = 5,
 ) -> SynthesisResult:
-    """Apply rejection-sampling correction to synthetic two-person households.
-
-    Non-two-person households are retained unchanged.
-    
-    Parameters
-    ----------
-    verbose : bool
-        If True, print detailed diagnostics about rejection process.
-    stage : str
-        Label for diagnostics output (e.g., 'First-pass', 'Top-up batch 1')
-    batch_num : int
-        Batch number for diagnostics
-    """
+    """Apply rejection-sampling correction for all household sizes >= 2."""
     rng = rng or np.random.default_rng()
 
-    prop_feat, prop_gid = two_person_pair_features( # synthetic pop feature pairs and their household ids
-        synthetic.individual_data, synthetic.individual_group_id, age_col=age_col, sex_col=sex_col
+    prop_feat, prop_gid, prop_sizes, prop_invalid = extract_pair_features_by_size(
+        synthetic.individual_data,
+        synthetic.individual_group_id,
+        age_col=age_col,
+        employ_col=employ_col,
+        age_code_to_order=age_code_to_order,
+        employ_code_to_group=employ_code_to_group,
+        age_diff_n_bins=age_diff_n_bins,
     )
-    tgt_feat, _ = two_person_pair_features( # target pop feature pairs and their household ids (not used in rejection but could be useful for diagnostics)
+    tgt_feat, _, tgt_sizes, _ = extract_pair_features_by_size(
         np.asarray(target_individual_data, dtype=int),
         np.asarray(target_individual_group_id, dtype=int),
         age_col=age_col,
-        sex_col=sex_col,
+        employ_col=employ_col,
+        age_code_to_order=age_code_to_order,
+        employ_code_to_group=employ_code_to_group,
+        age_diff_n_bins=age_diff_n_bins,
     )
 
     if prop_feat.size == 0 or tgt_feat.size == 0:
-        print("No two-person features pair available for rejection correction; skipping.")
+        if verbose:
+            print("No household features available for rejection correction; skipping.")
         return synthetic
 
-    shape = (
-        max(int(np.max(prop_feat[:, 0])), int(np.max(tgt_feat[:, 0]))),
-        max(int(np.max(prop_feat[:, 1])), int(np.max(tgt_feat[:, 1]))),
-    )
+    stats_by_size: dict[int, dict[str, float | int | bool]] = {}
+    accept_mask = np.zeros((prop_feat.shape[0],), dtype=bool)
 
-    proposal_prob = _feature_distribution(prop_feat, shape=shape) 
-    target_prob = _feature_distribution(tgt_feat, shape=shape)
-    
-    if verbose:
-        print(f"\n[REJECT-{stage} {batch_num}] Applying rejection filter to size=2 households...")
-    
-    accept_two = rejection_filter_two_person_households(
-        prop_feat, target_prob, proposal_prob, rng=rng, verbose=verbose
-    )
+    # Upfront sparsity-guard report: identify sizes that will be bypassed before the loop.
+    sparsity_bypassed = sorted([
+        int(s) for s in set(prop_sizes.tolist())
+        if int(np.sum(tgt_sizes == s)) < min_target_samples
+    ])
+    if sparsity_bypassed:
+        print(
+            f"[INFO-{stage} {batch_num}] Sparsity guard (< {min_target_samples} target "
+            f"examples): sizes {sparsity_bypassed} — rejection bypassed, all accepted."
+        )
 
-    keep_two_groups = set(prop_gid[accept_two].tolist())
+    for size in sorted(set(prop_sizes.tolist())):
+        prop_mask = prop_sizes == size
+        tgt_mask = tgt_sizes == size
 
-    # Keep all households with size != 2 and accepted two-person households.
+        n_proposed = int(np.sum(prop_mask))
+        if n_proposed == 0:
+            continue
+
+        n_target = int(np.sum(tgt_mask))
+        if n_target < min_target_samples:
+            # Too few target examples: noisy distribution is worse than no correction.
+            # Always accept households of this size (same behaviour as target_missing).
+            accept_mask[prop_mask] = True
+            stats_by_size[int(size)] = {
+                "n_proposed": n_proposed,
+                "n_accepted": n_proposed,
+                "accept_rate": 1.0,
+                "M_raw": 0.0,
+                "M": 0.0,
+                "f1_zero_bins": 0,
+                "target_missing": True,
+            }
+            continue
+
+        shape = (
+            max(int(np.max(prop_feat[prop_mask, 0])), int(np.max(tgt_feat[tgt_mask, 0]))),
+            max(int(np.max(prop_feat[prop_mask, 1])), int(np.max(tgt_feat[tgt_mask, 1]))),
+        )
+
+        proposal_prob = _feature_distribution(prop_feat[prop_mask], shape=shape)
+        target_prob = _feature_distribution(tgt_feat[tgt_mask], shape=shape)
+
+        if verbose:
+            print(f"\n[REJECT-{stage} {batch_num}] Applying rejection for size={size} households...")
+
+        accept_size, stats = rejection_filter_by_size(
+            prop_feat[prop_mask],
+            target_prob,
+            proposal_prob,
+            rng=rng,
+            verbose=verbose,
+        )
+        accept_mask[prop_mask] = accept_size
+
+        stats_by_size[int(size)] = {
+            "n_proposed": n_proposed,
+            "n_accepted": int(np.sum(accept_size)),
+            "accept_rate": float(np.mean(accept_size)) if accept_size.size > 0 else 0.0,
+            "M_raw": stats.get("M_raw", 0.0),
+            "M": stats.get("M", 0.0),
+            "f1_zero_bins": int(stats.get("f1_zero_bins", 0)),
+            "target_missing": False,
+        }
+
+    keep_groups = set(prop_gid[accept_mask].tolist())
+    keep_groups.update(prop_invalid.tolist())
+
     all_groups = np.arange(1, synthetic.household_data.shape[0] + 1)
-
-    sizes: np.ndarray | None = None # if household_size_col is provided and valid, use it to determine which households are two-person; otherwise, infer sizes from individual group ids.
     if household_size_col is not None and 0 <= household_size_col < synthetic.household_data.shape[1]:
         sizes = synthetic.household_data[:, household_size_col].astype(int)
     else:
-        # Fallback: infer household sizes from sampled individuals when size column is unavailable.
-        sizes = np.bincount(synthetic.individual_group_id, minlength=synthetic.household_data.shape[0] + 1)[1:].astype(int)
+        sizes = _infer_household_sizes(synthetic.individual_group_id, synthetic.household_data.shape[0])
 
-    keep_groups: list[int] = []
+    keep_list: list[int] = []
     for g in all_groups:
-        if int(sizes[g - 1]) != 2: # if size column is available and indicates not two-person, keep the household without rejection; otherwise, rely on inferred sizes.
-            keep_groups.append(int(g))
-        elif int(g) in keep_two_groups:
-            keep_groups.append(int(g))
+        if int(sizes[g - 1]) < 2:
+            keep_list.append(int(g))
+        elif int(g) in keep_groups:
+            keep_list.append(int(g))
 
-    keep_groups_arr = np.asarray(keep_groups, dtype=int)
+    keep_groups_arr = np.asarray(keep_list, dtype=int)
     if keep_groups_arr.size == 0:
         return synthetic
-    
-    # Compute diagnostics BEFORE re-indexing
+
     if verbose:
-        # Create placeholder result to compute after-rejection sizes
         after_mask = np.isin(all_groups, keep_groups_arr)
         after_household = synthetic.household_data[after_mask, :]
-        
-        # Recalculate alphas for diagnostics
-        alpha_for_diag = rejection_filter_two_person_households(
-            prop_feat, target_prob, proposal_prob, rng=rng, verbose=False
-        )
-        
         _rejection_diagnostics_for_batch(
             stage=stage,
             batch_num=batch_num,
             before_household_data=synthetic.household_data,
             after_household_data=after_household,
-            prop_feat=prop_feat,
-            alpha_vals=alpha_for_diag,
-            accept_mask=accept_two,
-            proposal_prob=proposal_prob,
-            target_prob=target_prob,
+            stats_by_size=stats_by_size,
             household_size_col=household_size_col or 3,
         )
 
-    # Re-index kept households to 1..N_new.
     old_to_new = {int(g): i + 1 for i, g in enumerate(keep_groups_arr.tolist())}
 
     keep_house_mask = np.isin(all_groups, keep_groups_arr)
@@ -501,6 +688,37 @@ def apply_two_person_rejection(
         individual_group_id=new_ind_gid,
         household_class=new_household_class,
         individual_class=new_ind_class,
+    )
+
+
+def apply_two_person_rejection(
+    synthetic: SynthesisResult,
+    target_individual_data: np.ndarray,
+    target_individual_group_id: np.ndarray,
+    age_col: int = 0,
+    sex_col: int = 1,
+    household_size_col: int | None = 3,
+    rng: np.random.Generator | None = None,
+    verbose: bool = False,
+    stage: str = "Rejection",
+    batch_num: int = 0,
+) -> SynthesisResult:
+    warnings.warn(
+        "apply_two_person_rejection is deprecated; use apply_rejection_by_size instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return apply_rejection_by_size(
+        synthetic=synthetic,
+        target_individual_data=target_individual_data,
+        target_individual_group_id=target_individual_group_id,
+        age_col=age_col,
+        employ_col=sex_col,
+        household_size_col=household_size_col,
+        rng=rng,
+        verbose=verbose,
+        stage=stage,
+        batch_num=batch_num,
     )
 
 
@@ -527,11 +745,101 @@ def _slice_first_households(synth: SynthesisResult, n_keep: int, hh_offset: int)
     )
 
 
+def _slice_households_by_indices(
+    synth: SynthesisResult,
+    keep_indices: np.ndarray,
+    hh_offset: int,
+) -> SynthesisResult:
+    if keep_indices.size == 0:
+        return SynthesisResult(
+            household_data=np.zeros((0, synth.household_data.shape[1]), dtype=int),
+            individual_data=np.zeros((0, synth.individual_data.shape[1]), dtype=int),
+            individual_group_id=np.zeros((0,), dtype=int),
+            household_class=np.zeros((0,), dtype=int),
+            individual_class=np.zeros((0,), dtype=int),
+        )
+
+    keep_indices = np.asarray(np.sort(keep_indices), dtype=int)
+    keep_groups = keep_indices + 1
+    old_to_new = {int(g): i + 1 for i, g in enumerate(keep_groups.tolist())}
+
+    keep_house_mask = np.zeros((synth.household_data.shape[0],), dtype=bool)
+    keep_house_mask[keep_indices] = True
+    new_household_data = synth.household_data[keep_house_mask, :]
+    new_household_class = synth.household_class[keep_house_mask]
+
+    keep_ind_mask = np.isin(synth.individual_group_id, keep_groups)
+    new_ind_data = synth.individual_data[keep_ind_mask, :]
+    new_ind_class = synth.individual_class[keep_ind_mask]
+    new_ind_gid_old = synth.individual_group_id[keep_ind_mask]
+    new_ind_gid = np.array([old_to_new[int(g)] for g in new_ind_gid_old], dtype=int)
+
+    return SynthesisResult(
+        household_data=new_household_data,
+        individual_data=new_ind_data,
+        individual_group_id=new_ind_gid + int(hh_offset),
+        household_class=new_household_class,
+        individual_class=new_ind_class,
+    )
+
+
+def _size_counts_from_households(
+    household_data: np.ndarray,
+    household_size_col: int,
+) -> dict[int, int]:
+    sizes = household_data[:, household_size_col].astype(int)
+    counts: dict[int, int] = {}
+    for size in sizes:
+        counts[int(size)] = counts.get(int(size), 0) + 1
+    return counts
+
+
+def _scale_size_counts(counts: dict[int, int], target_total: int) -> dict[int, int]:
+    if target_total <= 0:
+        return {size: 0 for size in counts}
+
+    raw_total = int(sum(counts.values()))
+    if raw_total <= 0:
+        return {size: 0 for size in counts}
+
+    expected = {size: counts[size] * target_total / raw_total for size in counts}
+    base = {size: int(math.floor(val)) for size, val in expected.items()}
+    remainder = target_total - sum(base.values())
+    if remainder > 0:
+        frac_order = sorted(expected.items(), key=lambda kv: kv[1] - math.floor(kv[1]), reverse=True)
+        for size, _ in frac_order[:remainder]:
+            base[size] += 1
+
+    return base
+
+
+def _take_households_by_size( # take up to the needed count of households by size from the given SynthesisResult, returning the taken subset and the updated need_by_size counts.
+    synth: SynthesisResult,
+    need_by_size: dict[int, int],
+    household_size_col: int,
+    hh_offset: int,
+) -> tuple[SynthesisResult, dict[int, int]]:
+    sizes = synth.household_data[:, household_size_col].astype(int)
+    keep_indices: list[int] = []
+    for idx, size in enumerate(sizes):
+        need = need_by_size.get(int(size), 0)
+        if need > 0:
+            keep_indices.append(idx)
+            need_by_size[int(size)] = need - 1
+
+    taken = _slice_households_by_indices(
+        synth=synth,
+        keep_indices=np.asarray(keep_indices, dtype=int),
+        hh_offset=hh_offset,
+    )
+    return taken, need_by_size
+
+
 # paper_ref: Section 4.3 + Section 4.4 (Eq. 16) combined with target-count guarantee
 # matlab_ref: run_create_2.m + run_two_within_the_same_4.m (oversample-then-reject pattern)
-# intent: produce exactly n_households after Eq.16 rejection by redrawing fresh batches
+# intent: produce exactly n_households after rejection by redrawing fresh batches
 #         instead of MATLAB's row-duplication hack, so the output has no duplicate rows.
-def generate_with_two_person_rejection(
+def generate_with_multi_size_rejection(
     n_households: int,
     pi_g: np.ndarray,
     pi_m: np.ndarray,
@@ -542,22 +850,20 @@ def generate_with_two_person_rejection(
     *,
     household_size_col: int = 3,
     age_col: int = 0,
-    sex_col: int = 1,
+    employ_col: int = 1,
     initial_oversample: float = 1.5,
     topup_factor: float = 1.7,
     max_topup_iters: int = 10,
     rng: np.random.Generator | None = None,
+    age_code_to_order: np.ndarray | None = None,
+    employ_code_to_group: np.ndarray | None = None,
+    min_target_samples: int = 30,
+    age_diff_n_bins: int = 5,
 ) -> SynthesisResult:
-    """Generate exactly n_households synthetic households with two-person rejection applied.
+    """Generate exactly n_households synthetic households with size-aware rejection.
 
-    Single-pass rejection (`apply_two_person_rejection` alone) drops two-person households
-    whose (|age-diff|, |sex-diff|) features are over-represented in the proposal vs PUMS,
-    which can leave the size-2 stratum severely depleted. This helper oversamples up front
-    and, if the post-rejection count is still short of the target, draws fresh batches and
-    re-applies rejection until the target is reached.
-
-    Returns a SynthesisResult with exactly ``n_households`` rows. Raises if the target
-    cannot be reached within ``max_topup_iters``.
+    The target size counts are computed from the initial synthetic draw and scaled
+    to ``n_households`` so the final output preserves the model-implied size mix.
     """
     if n_households <= 0:
         raise ValueError("n_households must be positive")
@@ -580,31 +886,47 @@ def generate_with_two_person_rejection(
         household_size_col=household_size_col,
         rng=rng,
     )
-    kept = apply_two_person_rejection(
+
+    if household_size_col < 0 or household_size_col >= raw.household_data.shape[1]:
+        raise ValueError("household_size_col out of range for household_data")
+
+    raw_counts = _size_counts_from_households(raw.household_data, household_size_col)
+    target_counts = _scale_size_counts(raw_counts, n_households)
+
+    kept = apply_rejection_by_size(
         synthetic=raw,
         target_individual_data=target_individual_data,
         target_individual_group_id=target_individual_group_id,
         age_col=age_col,
-        sex_col=sex_col,
+        employ_col=employ_col,
         household_size_col=household_size_col,
         rng=rng,
         verbose=True,
         stage="First-pass",
         batch_num=0,
+        age_code_to_order=age_code_to_order,
+        employ_code_to_group=employ_code_to_group,
+        min_target_samples=min_target_samples,
+        age_diff_n_bins=age_diff_n_bins,
     )
 
     parts: list[SynthesisResult] = []
     hh_offset = 0
-    take = _slice_first_households(kept, n_households, hh_offset)
+    take, target_counts = _take_households_by_size(
+        synth=kept,
+        need_by_size=target_counts,
+        household_size_col=household_size_col,
+        hh_offset=hh_offset,
+    )
     parts.append(take)
     hh_offset += take.household_data.shape[0]
-    remaining = n_households - take.household_data.shape[0]
+    remaining = int(sum(target_counts.values()))
 
     iters = 0
     while remaining > 0:
         if iters >= max_topup_iters:
             raise RuntimeError(
-                f"generate_with_two_person_rejection: could not reach target "
+                f"generate_with_multi_size_rejection: could not reach target "
                 f"{n_households} households after {max_topup_iters} top-up iterations "
                 f"(short by {remaining}). Try increasing max_topup_iters or topup_factor."
             )
@@ -619,24 +941,34 @@ def generate_with_two_person_rejection(
             household_size_col=household_size_col,
             rng=rng,
         )
-        batch_kept = apply_two_person_rejection(
+        batch_kept = apply_rejection_by_size(
             synthetic=batch_raw,
             target_individual_data=target_individual_data,
             target_individual_group_id=target_individual_group_id,
             age_col=age_col,
-            sex_col=sex_col,
+            employ_col=employ_col,
             household_size_col=household_size_col,
             rng=rng,
             verbose=True,
-            stage=f"Top-up batch",
+            stage="Top-up batch",
             batch_num=iters,
+            age_code_to_order=age_code_to_order,
+            employ_code_to_group=employ_code_to_group,
+            min_target_samples=min_target_samples,
+            age_diff_n_bins=age_diff_n_bins,
         )
-        batch_take = _slice_first_households(batch_kept, remaining, hh_offset)
+        batch_take, target_counts = _take_households_by_size(
+            synth=batch_kept,
+            need_by_size=target_counts,
+            household_size_col=household_size_col,
+            hh_offset=hh_offset,
+        )
         if batch_take.household_data.shape[0] == 0:
+            remaining = int(sum(target_counts.values()))
             continue
         parts.append(batch_take)
         hh_offset += batch_take.household_data.shape[0]
-        remaining -= batch_take.household_data.shape[0]
+        remaining = int(sum(target_counts.values()))
 
     household_data = np.vstack([p.household_data for p in parts])
     household_class = np.concatenate([p.household_class for p in parts])
@@ -650,4 +982,44 @@ def generate_with_two_person_rejection(
         individual_group_id=individual_group_id,
         household_class=household_class,
         individual_class=individual_class,
+    )
+
+
+def generate_with_two_person_rejection(
+    n_households: int,
+    pi_g: np.ndarray,
+    pi_m: np.ndarray,
+    phi_g: Sequence[np.ndarray],
+    phi_m: Sequence[np.ndarray],
+    target_individual_data: np.ndarray,
+    target_individual_group_id: np.ndarray,
+    *,
+    household_size_col: int = 3,
+    age_col: int = 0,
+    sex_col: int = 1,
+    initial_oversample: float = 1.5,
+    topup_factor: float = 1.7,
+    max_topup_iters: int = 20,
+    rng: np.random.Generator | None = None,
+) -> SynthesisResult:
+    warnings.warn(
+        "generate_with_two_person_rejection is deprecated; use generate_with_multi_size_rejection instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return generate_with_multi_size_rejection(
+        n_households=n_households,
+        pi_g=pi_g,
+        pi_m=pi_m,
+        phi_g=phi_g,
+        phi_m=phi_m,
+        target_individual_data=target_individual_data,
+        target_individual_group_id=target_individual_group_id,
+        household_size_col=household_size_col,
+        age_col=age_col,
+        employ_col=sex_col,
+        initial_oversample=initial_oversample,
+        topup_factor=topup_factor,
+        max_topup_iters=max_topup_iters,
+        rng=rng,
     )

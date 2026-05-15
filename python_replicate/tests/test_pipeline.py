@@ -48,7 +48,7 @@ class PipelineTests(unittest.TestCase):
             seed=99,
             apply_rejection=True,
             age_col=0,
-            sex_col=1,
+            employ_col=1,
         )
 
         self.assertEqual(result.synthetic_raw.household_data.shape[0], 10)
@@ -113,7 +113,7 @@ class PipelineTests(unittest.TestCase):
             seed=2026,
             apply_rejection=True,
             age_col=0,
-            sex_col=1,
+            employ_col=1,
             household_size_col=2,
         )
 

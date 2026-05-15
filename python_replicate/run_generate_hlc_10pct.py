@@ -14,6 +14,7 @@ from hm_popsyn.io import prepare_from_merged_table
 from hm_popsyn.em import select_model_grid
 from hm_popsyn.pipeline import fit_and_generate
 from hm_popsyn.metrics import evaluate_synthetic
+from hm_popsyn.synthesis_eval import _AGE_CODE_TO_ORDER_LEGACY, _EMPLOY_CODE_TO_GROUP_LEGACY
 
 import time
 from tqdm import tqdm
@@ -32,9 +33,11 @@ from tqdm import tqdm
 #  10  Ind_RELATIONSHIP Ind attr  → sex_col=2 in prepared inddata
 
 # Rejection sampling uses:
-#   age_col=0            (Ind_AGE, 0-based index in prepared inddata)
-#   sex_col=2            (Ind_RELATIONSHIP, 0-based index in prepared inddata)
+#   age_col=0            (Ind_AGE,    0-based index in prepared inddata)
+#   employ_col=1         (Ind_EMPLOY, 0-based index in prepared inddata)
 #   household_size_col=2 (HH_TOTALPAX, 0-based index in prepared grpdata; same in both PLN variants)
+# Legacy codebook constants are passed explicitly because seed4556 uses a different
+# category encoding order than the new seed505 files.
 
 # Column names for the original 11-column input (used by evaluate_synthetic).
 _ORIG_COL_NAMES = [
@@ -44,20 +47,20 @@ _ORIG_COL_NAMES = [
 ]
 
 _VARIANTS = [
-    {
-        "pln_label": "with_PLN",
-        "household_attr_cols": (2, 3, 4, 5, 6, 7),
-        "csv_header": (
-            "HH_id,Ind_id,"
-            "HH_HOUSETYPE,HH_INCOME,HH_TOTALPAX,HH_CAR,HH_BIKE,HH_PLN_Area,"
-            "Ind_AGE,Ind_EMPLOY,Ind_RELATIONSHIP"
-        ),
-        "col_names": [
-            "HH_id", "Ind_id",
-            "HH_HOUSETYPE", "HH_INCOME", "HH_TOTALPAX", "HH_CAR", "HH_BIKE", "HH_PLN_Area",
-            "Ind_AGE", "Ind_EMPLOY", "Ind_RELATIONSHIP",
-        ],
-    },
+    # {
+    #     "pln_label": "with_PLN",
+    #     "household_attr_cols": (2, 3, 4, 5, 6, 7),
+    #     "csv_header": (
+    #         "HH_id,Ind_id,"
+    #         "HH_HOUSETYPE,HH_INCOME,HH_TOTALPAX,HH_CAR,HH_BIKE,HH_PLN_Area,"
+    #         "Ind_AGE,Ind_EMPLOY,Ind_RELATIONSHIP"
+    #     ),
+    #     "col_names": [
+    #         "HH_id", "Ind_id",
+    #         "HH_HOUSETYPE", "HH_INCOME", "HH_TOTALPAX", "HH_CAR", "HH_BIKE", "HH_PLN_Area",
+    #         "Ind_AGE", "Ind_EMPLOY", "Ind_RELATIONSHIP",
+    #     ],
+    # },
     {
         "pln_label": "without_PLN",
         "household_attr_cols": (2, 3, 4, 5, 6),
@@ -144,7 +147,7 @@ def main() -> int:
     parser.add_argument("--G", type=int, default=5)
     parser.add_argument("--M", type=int, default=8)
     parser.add_argument("--n-restarts", type=int, default=5)
-    parser.add_argument("--max-iter", type=int, default=1000)
+    parser.add_argument("--max-iter", type=int, default=1000) # max iterations for EM fitting (per G/M combination)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--disable-gm-search", action="store_true")
     parser.add_argument("--g-candidates", default="3,4,5,6,7")
@@ -180,7 +183,7 @@ def main() -> int:
     # Phase 1: Prepare data + BIC model selection (once per PLN variant)
     # ------------------------------------------------------------------
     prepared_configs: list[dict] = []
-    for variant in _VARIANTS:
+    for variant in _VARIANTS: # loop over PLN variants (with_PLN, without_PLN)
         pln_label: str = variant["pln_label"]
         hh_attr_cols: tuple = variant["household_attr_cols"]
 
@@ -289,9 +292,11 @@ def main() -> int:
             tol=1e-7,
             seed=args.seed,
             apply_rejection=apply_rejection,
-            age_col=0,            # Ind_AGE  (index 0 in prepared inddata)
-            sex_col=2,            # Ind_RELATIONSHIP (index 2 in prepared inddata)
+            age_col=0,            # Ind_AGE    (index 0 in prepared inddata)
+            employ_col=1,         # Ind_EMPLOY (index 1 in prepared inddata)
             household_size_col=2, # HH_TOTALPAX (index 2 in prepared grpdata)
+            age_code_to_order=_AGE_CODE_TO_ORDER_LEGACY,      # seed4556 non-natural age encoding
+            employ_code_to_group=_EMPLOY_CODE_TO_GROUP_LEGACY, # seed4556 non-alphabetical employ encoding
         )
 
         _log(
@@ -321,7 +326,7 @@ def main() -> int:
             if correction != 0:
                 merged_out[:, 2 + out_offset] += correction
 
-        output_stem = out_dir / f"generated_HLC_10pct_{pln_label}_{rejection_label}"
+        output_stem = out_dir / f"generated_HLC_10pct_{pln_label}_{rejection_label}_seed{args.seed}_date{time.strftime('%Y%m%d_%H%M%S')}"
         _save_synthetic_output(merged_out, output_stem, csv_header)
         _log(f"[INFO] Elapsed: {time.time() - start_time:.1f}s")
 
